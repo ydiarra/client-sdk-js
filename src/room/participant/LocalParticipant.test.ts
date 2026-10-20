@@ -323,3 +323,59 @@ describe('LocalParticipant republishing a track whose upstream is paused', () =>
     expect(req.muted).toBe(true);
   });
 });
+
+describe('LocalParticipant mute state sent to the server', () => {
+  // the server sees a track as muted while it is muted, and while its upstream is paused
+  type MuteHandlers = {
+    onTrackMuted: (track: LocalTrack) => void;
+    onTrackUnmuted: (track: LocalTrack) => void;
+    onTrackUpstreamPaused: (track: LocalTrack) => void;
+    onTrackUpstreamResumed: (track: LocalTrack) => void;
+  };
+
+  function makeParticipantWithEngine() {
+    const updateMuteStatus = vi.fn();
+    const sendMuteTrack = vi.fn();
+    // the handlers are instance fields, so the participant has to be constructed
+    const engine = { updateMuteStatus, client: { sendMuteTrack } } as Record<string, unknown>;
+    engine.on = vi.fn(() => engine);
+    const participant = new LocalParticipant('PA_local', 'local', engine as never, {} as never);
+    return {
+      participant,
+      handlers: participant as unknown as MuteHandlers,
+      updateMuteStatus,
+      sendMuteTrack,
+    };
+  }
+
+  function makeMuteTrack(state: { isMuted: boolean; isUpstreamPaused: boolean }) {
+    return { sid: 'TR_track', ...state } as unknown as LocalTrack;
+  }
+
+  it.each([
+    ['onTrackMuted', { isMuted: true, isUpstreamPaused: false }, true],
+    ['onTrackUnmuted', { isMuted: false, isUpstreamPaused: false }, false],
+    ['onTrackUnmuted', { isMuted: false, isUpstreamPaused: true }, true],
+    ['onTrackUpstreamPaused', { isMuted: false, isUpstreamPaused: true }, true],
+    ['onTrackUpstreamResumed', { isMuted: false, isUpstreamPaused: false }, false],
+    ['onTrackUpstreamResumed', { isMuted: true, isUpstreamPaused: false }, true],
+  ] as const)('%s with %o sends muted %s', (handler, state, muted) => {
+    const { handlers, updateMuteStatus } = makeParticipantWithEngine();
+
+    handlers[handler](makeMuteTrack(state));
+
+    expect(updateMuteStatus).toHaveBeenCalledExactlyOnceWith('TR_track', muted);
+  });
+
+  it('corrects the server when it disagrees about a paused track', () => {
+    const { participant, sendMuteTrack } = makeParticipantWithEngine();
+    const track = makeMuteTrack({ isMuted: false, isUpstreamPaused: true });
+    participant.trackPublications.set('TR_track', { isMuted: false, track } as never);
+    vi.spyOn(Object.getPrototypeOf(LocalParticipant.prototype), 'updateInfo').mockReturnValue(true);
+
+    participant.updateInfo({ tracks: [{ sid: 'TR_track', muted: false }] } as never);
+
+    expect(sendMuteTrack).toHaveBeenCalledExactlyOnceWith('TR_track', true);
+    vi.restoreAllMocks();
+  });
+});

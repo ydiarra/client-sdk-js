@@ -269,6 +269,7 @@ describe('backup codec tracks', () => {
       },
       getConstraints: () => ({}),
       getSettings: () => ({}),
+      applyConstraints: async () => {},
       addEventListener: () => {},
       removeEventListener: () => {},
     };
@@ -503,5 +504,187 @@ describe('backup codec tracks', () => {
     // the clone shares the capture device, so leaving it live keeps the camera on
     expect(camera.readyState).toBe('ended');
     expect(info.mediaStreamTrack.readyState).toBe('ended');
+  });
+
+  // what each sender carries after each operation on the track, whichever code path applies it
+  describe('sender contents', () => {
+    function senderOf(track: LocalVideoTrack) {
+      return (track as unknown as { _sender: ReturnType<typeof makeTrackSender> })._sender;
+    }
+
+    // a processor that hands out a processed track of its own
+    function makeProcessor() {
+      const processor = {
+        name: 'blur',
+        processedTrack: undefined as MediaStreamTrack | undefined,
+        init: async () => {
+          processor.processedTrack = makeMediaStreamTrack('processed');
+        },
+        restart: async () => {
+          processor.processedTrack = makeMediaStreamTrack('processed');
+        },
+        destroy: async () => {},
+      };
+      return processor as unknown as TrackProcessor<Track.Kind.Video> & {
+        processedTrack: FakeTrack;
+      };
+    }
+
+    const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, 'mediaDevices');
+
+    afterEach(() => {
+      if (originalMediaDevices) {
+        Object.defineProperty(navigator, 'mediaDevices', originalMediaDevices);
+      } else {
+        delete (navigator as { mediaDevices?: unknown }).mediaDevices;
+      }
+    });
+
+    // an SDK managed camera reacquires its capture through getUserMedia
+    function stubCapture(next: FakeTrack) {
+      Object.defineProperty(navigator, 'mediaDevices', {
+        configurable: true,
+        value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [next] })) },
+      });
+    }
+
+    it('takes the track off every sender while paused, and puts the current one back on resume', async () => {
+      const camera = makeMediaStreamTrack('camera');
+      const { track, info, backup } = await publishWithBackupCodec(camera);
+
+      await track.pauseUpstream();
+      expect(track.isUpstreamPaused).toBe(true);
+      expect(senderOf(track).track).toBeNull();
+      expect(backup.track).toBeNull();
+
+      await track.resumeUpstream();
+      expect(track.isUpstreamPaused).toBe(false);
+      expect(senderOf(track).track).toBe(camera);
+      expect(backup.track).toBe(info.mediaStreamTrack);
+      expect(info.mediaStreamTrack.readyState).toBe('live');
+    });
+
+    it('resumes upstream when the track of a paused track is replaced', async () => {
+      const { track, backup } = await publishWithBackupCodec(makeMediaStreamTrack('camera'));
+      await track.pauseUpstream();
+
+      const newCamera = makeMediaStreamTrack('new-camera');
+      await track.replaceTrack(newCamera);
+
+      expect(track.isUpstreamPaused).toBe(false);
+      expect(senderOf(track).track).toBe(newCamera);
+      expect(backup.track).toBe(newCamera.clones[0]);
+    });
+
+    it('sends the new capture and a clone of it when an SDK managed camera restarts', async () => {
+      const camera = makeMediaStreamTrack('camera');
+      const { track, info, backup } = await publishWithBackupCodec(camera, false);
+      const oldClone = info.mediaStreamTrack;
+      const newCapture = makeMediaStreamTrack('new-capture');
+      stubCapture(newCapture);
+
+      await track.restartTrack();
+
+      expect(camera.readyState).toBe('ended');
+      expect(oldClone.readyState).toBe('ended');
+      expect(senderOf(track).track).toBe(newCapture);
+      expect(backup.track).toBe(newCapture.clones[0]);
+      expect(newCapture.clones[0].readyState).toBe('live');
+    });
+
+    it('sends the new capture and a clone of it when an SDK managed camera is unmuted', async () => {
+      const { track, backup } = await publishWithBackupCodec(makeMediaStreamTrack('camera'), false);
+      Object.defineProperty(track, 'source', { get: () => Track.Source.Camera });
+      await track.mute();
+      const newCapture = makeMediaStreamTrack('new-capture');
+      stubCapture(newCapture);
+
+      await track.unmute();
+
+      expect(track.isMuted).toBe(false);
+      expect(senderOf(track).track).toBe(newCapture);
+      expect(backup.track).toBe(newCapture.clones[0]);
+      expect(newCapture.clones[0].readyState).toBe('live');
+    });
+
+    it('disables a user provided camera and its clones on mute, and keeps them on the senders', async () => {
+      const camera = makeMediaStreamTrack('camera');
+      const { track, info, backup } = await publishWithBackupCodec(camera);
+      Object.defineProperty(track, 'source', { get: () => Track.Source.Camera });
+
+      await track.mute();
+      expect(camera.enabled).toBe(false);
+      expect(info.mediaStreamTrack.enabled).toBe(false);
+      expect(camera.readyState).toBe('live');
+      expect(senderOf(track).track).toBe(camera);
+      expect(backup.track).toBe(info.mediaStreamTrack);
+
+      await track.unmute();
+      expect(camera.enabled).toBe(true);
+      expect(info.mediaStreamTrack.enabled).toBe(true);
+    });
+
+    it('sends the processed track and a clone of it once a processor is set', async () => {
+      const camera = makeMediaStreamTrack('camera');
+      const { track, info, backup } = await publishWithBackupCodec(camera);
+      const cameraClone = info.mediaStreamTrack;
+      const processor = makeProcessor();
+
+      await track.setProcessor(processor);
+
+      const processed = processor.processedTrack;
+      expect(senderOf(track).track).toBe(processed);
+      expect(backup.track).toBe(processed.clones[0]);
+      expect(cameraClone.readyState).toBe('ended');
+      expect(camera.readyState).toBe('live');
+    });
+
+    it('sends the camera and a clone of it again once the processor is stopped', async () => {
+      const camera = makeMediaStreamTrack('camera');
+      const { track, backup } = await publishWithBackupCodec(camera);
+      const processor = makeProcessor();
+      await track.setProcessor(processor);
+      const processedClone = processor.processedTrack.clones[0];
+
+      await track.stopProcessor();
+
+      expect(senderOf(track).track).toBe(camera);
+      expect(backup.track).toBe(camera.clones[camera.clones.length - 1]);
+      expect(backup.track?.readyState).toBe('live');
+      expect(processedClone.readyState).toBe('ended');
+    });
+
+    it('resumes upstream when the processor of a paused track is stopped', async () => {
+      const camera = makeMediaStreamTrack('camera');
+      const { track, backup } = await publishWithBackupCodec(camera);
+      await track.setProcessor(makeProcessor());
+      await track.pauseUpstream();
+
+      await track.stopProcessor();
+
+      expect(track.isUpstreamPaused).toBe(false);
+      expect(senderOf(track).track).toBe(camera);
+      expect(backup.track?.readyState).toBe('live');
+    });
+
+    it('leaves the primary sender alone once its transport is closed', async () => {
+      const { track } = await publishWithBackupCodec(makeMediaStreamTrack('camera'));
+      const primary = senderOf(track);
+      Object.assign(primary, { transport: { state: 'closed' } });
+      primary.replaceTrack.mockClear();
+
+      await track.pauseUpstream();
+      await track.resumeUpstream();
+
+      expect(primary.replaceTrack).not.toHaveBeenCalled();
+    });
+
+    it('stops every clone when the track is stopped', async () => {
+      const { track, info } = await publishWithBackupCodec(makeMediaStreamTrack('camera'));
+
+      track.stop();
+
+      expect(info.mediaStreamTrack.readyState).toBe('ended');
+    });
   });
 });
