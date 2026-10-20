@@ -5,11 +5,14 @@ import {
   VideoQuality,
 } from '@livekit/protocol';
 import { describe, expect, it, vi } from 'vitest';
+import type { StructuredLogger } from '../../logger';
+import type { CoreRoom } from '../CoreRoom';
 import type LocalTrack from '../track/LocalTrack';
 import type LocalVideoTrack from '../track/LocalVideoTrack';
 import { Track } from '../track/Track';
 import type { TrackPublishOptions } from '../track/options';
-import LocalParticipant from './LocalParticipant';
+import { publishAdditionalCodecForTrack } from '../video/publisher';
+import { LocalParticipant } from './LocalParticipant';
 
 type FrameMetadataTestParticipant = {
   canPublishFrameMetadata: () => boolean;
@@ -97,7 +100,6 @@ type BackupCodecTestParticipant = {
     negotiate: ReturnType<typeof vi.fn>;
   };
   log: { warn: ReturnType<typeof vi.fn>; debug: ReturnType<typeof vi.fn> };
-  publishAdditionalCodecForTrack: LocalParticipant['publishAdditionalCodecForTrack'];
 };
 
 // a resizing processor makes mediaStreamTrack (processed) and dimensions (raw capture) differ
@@ -141,6 +143,21 @@ function makeBackupCodecParticipant(track: LocalVideoTrack) {
   return participant;
 }
 
+// the method lives in the video extension and reads the participant, engine and options off the room
+function publishBackupCodec(participant: BackupCodecTestParticipant, track: LocalVideoTrack) {
+  const room = {
+    localParticipant: participant,
+    engine: participant.engine,
+    options: participant.roomOptions,
+  } as unknown as CoreRoom;
+  return publishAdditionalCodecForTrack(
+    room,
+    participant.log as unknown as StructuredLogger,
+    track,
+    'vp8',
+  );
+}
+
 function capturedRequest(participant: BackupCodecTestParticipant): AddTrackRequest {
   expect(participant.engine.addTrack).toHaveBeenCalledOnce();
   return participant.engine.addTrack.mock.calls[0][0] as AddTrackRequest;
@@ -151,7 +168,7 @@ describe('LocalParticipant.publishAdditionalCodecForTrack', () => {
     const track = makeBackupCodecTrack({ width: 1280, height: 720 });
     const participant = makeBackupCodecParticipant(track);
 
-    await participant.publishAdditionalCodecForTrack(track, 'vp8');
+    await publishBackupCodec(participant, track);
 
     const req = capturedRequest(participant);
     expect(req.width).toBe(1280);
@@ -173,7 +190,7 @@ describe('LocalParticipant.publishAdditionalCodecForTrack', () => {
     const track = makeBackupCodecTrack({ width: 1280, height: 720 }, Track.Source.ScreenShare);
     const participant = makeBackupCodecParticipant(track);
 
-    await participant.publishAdditionalCodecForTrack(track, 'vp8');
+    await publishBackupCodec(participant, track);
 
     const req = capturedRequest(participant);
     expect(req.layers).toHaveLength(1);
@@ -191,7 +208,7 @@ describe('LocalParticipant.publishAdditionalCodecForTrack', () => {
     });
     const participant = makeBackupCodecParticipant(track);
 
-    await participant.publishAdditionalCodecForTrack(track, 'vp8');
+    await publishBackupCodec(participant, track);
 
     const req = capturedRequest(participant);
     expect(req.width).toBe(640);
@@ -200,11 +217,21 @@ describe('LocalParticipant.publishAdditionalCodecForTrack', () => {
     expect(req.simulcastCodecs[0].layers).toEqual(req.layers);
   });
 
+  it('announces the backup codec of a paused track as muted', async () => {
+    const track = makeBackupCodecTrack({ width: 1280, height: 720 });
+    Object.assign(track, { isUpstreamPaused: true });
+    const participant = makeBackupCodecParticipant(track);
+
+    await publishBackupCodec(participant, track);
+
+    expect(capturedRequest(participant).muted).toBe(true);
+  });
+
   it('omits layers when the capture dimensions are unknown', async () => {
     const track = makeBackupCodecTrack({});
     const participant = makeBackupCodecParticipant(track);
 
-    await participant.publishAdditionalCodecForTrack(track, 'vp8');
+    await publishBackupCodec(participant, track);
 
     const req = capturedRequest(participant);
     expect(req.width).toBe(0);
@@ -246,5 +273,53 @@ describe('LocalParticipant.unpublishTrack', () => {
 
     expect(clone.stop).toHaveBeenCalledOnce();
     expect(track.simulcastCodecs.size).toBe(0);
+  });
+});
+
+describe('LocalParticipant republishing a track whose upstream is paused', () => {
+  // a full reconnect unpublishes every track and publishes it again over a new sender, while
+  // the track keeps its paused upstream state
+  function makePausedMicrophone() {
+    return {
+      isLocal: true,
+      kind: Track.Kind.Audio,
+      source: Track.Source.Microphone,
+      isMuted: false,
+      isUpstreamPaused: true,
+      mediaStreamTrack: { id: 'microphone-cid' },
+      on: vi.fn(),
+      getSourceTrackSettings: () => ({}),
+    } as unknown as LocalTrack;
+  }
+
+  async function capturePublishRequest(track: LocalTrack) {
+    const addTrack = vi.fn(async () => {
+      throw new Error('stop after the add track request');
+    });
+    const participant = Object.create(LocalParticipant.prototype) as Record<string, unknown>;
+    Object.assign(participant, {
+      encryptionType: Encryption_Type.NONE,
+      trackPublications: new Map(),
+      enabledPublishVideoCodecs: [],
+      hasPermissionsToPublish: () => true,
+      canPublishFrameMetadata: () => false,
+      engine: { isClosed: false, addTrack },
+      log: { warn: vi.fn(), debug: vi.fn(), info: vi.fn() },
+    });
+    const publish = (
+      participant as unknown as {
+        publish: (track: LocalTrack, opts: TrackPublishOptions, isStereo: boolean) => Promise<void>;
+      }
+    ).publish.bind(participant);
+
+    await expect(publish(track, {}, false)).rejects.toThrow('stop after the add track request');
+    expect(addTrack).toHaveBeenCalledOnce();
+    return addTrack.mock.calls[0][0] as AddTrackRequest;
+  }
+
+  it('announces the track as muted to the server', async () => {
+    const req = await capturePublishRequest(makePausedMicrophone());
+
+    expect(req.muted).toBe(true);
   });
 });

@@ -16,6 +16,7 @@ import { roomOptionDefaults } from './defaults';
 import { ConnectionError, PublishDataError, UnexpectedConnectionState } from './errors';
 import { EngineEvent } from './events';
 import CriticalTimers from './timers';
+import type LocalVideoTrack from './track/LocalVideoTrack';
 import { Future } from './utils';
 
 describe('RTCEngine', () => {
@@ -91,10 +92,8 @@ describe('RTCEngine', () => {
   it('enables encoded insertable streams when a packet trailer worker is configured', () => {
     stubInsertableStreamsSupport();
 
-    const engine = new RTCEngine({
-      ...roomOptionDefaults,
-      packetTrailer: { worker: {} as Worker },
-    });
+    const engine = new RTCEngine(roomOptionDefaults);
+    engine.frameMetadataOptions = { worker: {} as Worker };
 
     expect(makeRTCConfiguration(engine).encodedInsertableStreams).toBe(true);
   });
@@ -103,10 +102,8 @@ describe('RTCEngine', () => {
     stubInsertableStreamsSupport();
     stubScriptTransformSupport();
 
-    const engine = new RTCEngine({
-      ...roomOptionDefaults,
-      packetTrailer: { worker: {} as Worker },
-    });
+    const engine = new RTCEngine(roomOptionDefaults);
+    engine.frameMetadataOptions = { worker: {} as Worker };
 
     expect(makeRTCConfiguration(engine).encodedInsertableStreams).toBeUndefined();
   });
@@ -152,10 +149,8 @@ describe('RTCEngine', () => {
   it('does not create sender passthrough streams for packet trailers when script transforms are supported', () => {
     stubScriptTransformSupport();
 
-    const engine = new RTCEngine({
-      ...roomOptionDefaults,
-      packetTrailer: { worker: {} as Worker },
-    });
+    const engine = new RTCEngine(roomOptionDefaults);
+    engine.frameMetadataOptions = { worker: {} as Worker };
     const createEncodedStreams = vi.fn();
     const sender = {
       createEncodedStreams,
@@ -170,10 +165,8 @@ describe('RTCEngine', () => {
     stubInsertableStreamsSupport();
 
     const worker = { postMessage: vi.fn() } as unknown as Worker;
-    const engine = new RTCEngine({
-      ...roomOptionDefaults,
-      packetTrailer: { worker },
-    });
+    const engine = new RTCEngine(roomOptionDefaults);
+    engine.frameMetadataOptions = { worker };
     const readable = {} as ReadableStream;
     const writable = {} as WritableStream;
     const createEncodedStreams = vi.fn(() => ({ readable, writable }));
@@ -216,10 +209,8 @@ describe('RTCEngine', () => {
     });
 
     const worker = {} as Worker;
-    const engine = new RTCEngine({
-      ...roomOptionDefaults,
-      packetTrailer: { worker },
-    });
+    const engine = new RTCEngine(roomOptionDefaults);
+    engine.frameMetadataOptions = { worker };
     const createEncodedStreams = vi.fn();
     const sender = {
       createEncodedStreams,
@@ -630,6 +621,68 @@ describe('RTCEngine', () => {
       fireClose(engine, DataChannelKind.RELIABLE);
 
       expect(error).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('createSender', () => {
+    // a full reconnect republishes every track over a new sender, including one whose upstream
+    // the application paused
+    function stubPublisher(engine: RTCEngine) {
+      vi.stubGlobal(
+        'RTCPeerConnection',
+        class {
+          addTransceiver() {}
+        },
+      );
+      const sender = { replaceTrack: vi.fn(async () => {}) };
+      Object.assign(engine as unknown as Record<string, unknown>, {
+        pcManager: { addPublisherTransceiver: vi.fn(async () => ({ sender })) },
+      });
+      return sender;
+    }
+
+    function makeTrack(isUpstreamPaused: boolean) {
+      return {
+        kind: 'video',
+        isUpstreamPaused,
+        mediaStreamTrack: { id: 'camera' },
+        setSimulcastTrackSender: vi.fn(async () => {}),
+      } as unknown as LocalVideoTrack;
+    }
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it('keeps a paused track off the new sender', async () => {
+      const engine = new RTCEngine(roomOptionDefaults);
+      const sender = stubPublisher(engine);
+
+      await engine.createSender(makeTrack(true), {});
+
+      expect(sender.replaceTrack).toHaveBeenCalledExactlyOnceWith(null);
+    });
+
+    it('keeps a paused track off a new backup codec sender', async () => {
+      const engine = new RTCEngine(roomOptionDefaults);
+      const sender = stubPublisher(engine);
+
+      await engine.createSimulcastSender(
+        makeTrack(true),
+        { codec: 'vp8', mediaStreamTrack: { id: 'camera-clone' } as MediaStreamTrack },
+        { videoCodec: 'vp8' },
+      );
+
+      expect(sender.replaceTrack).toHaveBeenCalledExactlyOnceWith(null);
+    });
+
+    it('leaves a track that is not paused on the new sender', async () => {
+      const engine = new RTCEngine(roomOptionDefaults);
+      const sender = stubPublisher(engine);
+
+      await engine.createSender(makeTrack(false), {});
+
+      expect(sender.replaceTrack).not.toHaveBeenCalled();
     });
   });
 
