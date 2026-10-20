@@ -73,6 +73,9 @@ export default abstract class LocalTrack<
 
   protected trackChangeLock: Mutex;
 
+  // innermost lock: taken after muteLock, trackChangeLock and pauseUpstreamLock
+  private senderSyncLock: Mutex;
+
   protected pendingDeviceChange: boolean = false;
 
   /**
@@ -95,6 +98,7 @@ export default abstract class LocalTrack<
     this.muteLock = new Mutex();
     this.pauseUpstreamLock = new Mutex();
     this.trackChangeLock = new Mutex();
+    this.senderSyncLock = new Mutex();
     this.trackChangeLock.lock().then(async (unlock) => {
       try {
         await this.setMediaStreamTrack(mediaTrack, true);
@@ -165,6 +169,8 @@ export default abstract class LocalTrack<
     isUnmuting?: boolean,
   ) {
     if (newTrack === this._mediaStreamTrack && !force) {
+      // nothing changes, but a sender that rejected this track before gets it again
+      await this.syncSenders();
       return;
     }
     if (this._mediaStreamTrack) {
@@ -213,21 +219,25 @@ export default abstract class LocalTrack<
       });
       processedTrack = this.processor.processedTrack;
     }
-    if (this.sender && this.sender.transport?.state !== 'closed') {
-      await this.sender.replaceTrack(processedTrack ?? newTrack);
-    }
-    // if `newTrack` is different from the existing track, stop the
-    // older track just before replacing it
-    if (!this.providedByUser && this._mediaStreamTrack !== newTrack) {
-      this._mediaStreamTrack.stop();
-    }
+    const previousTrack = this._mediaStreamTrack;
     this._mediaStreamTrack = newTrack;
+    try {
+      if (newTrack) {
+        // sync muted state with the enabled state of the newly provided track
+        // if restarting as part of an unmute, set enabled to true directly to avoid mute cycling
+        this._mediaStreamTrack.enabled = isUnmuting ? true : !this.isMuted;
+        // when a valid track is replace, we'd want to start producing
+        await this.resumeUpstream();
+      }
+      await this.syncSenders();
+    } finally {
+      // the previous track is stopped once the senders moved off it, or failed to: it was replaced
+      // either way
+      if (!this.providedByUser && previousTrack && previousTrack !== newTrack) {
+        previousTrack.stop();
+      }
+    }
     if (newTrack) {
-      // sync muted state with the enabled state of the newly provided track
-      // if restarting as part of an unmute, set enabled to true directly to avoid mute cycling
-      this._mediaStreamTrack.enabled = isUnmuting ? true : !this.isMuted;
-      // when a valid track is replace, we'd want to start producing
-      await this.resumeUpstream();
       this.attachedElements.forEach((el) => {
         attachToElement(processedTrack ?? newTrack, el);
       });
@@ -537,11 +547,8 @@ export default abstract class LocalTrack<
       if (this._isUpstreamPaused === true) {
         return;
       }
-      if (!this.sender) {
-        this.log.warn('unable to pause upstream for an unpublished track', this.logContext);
-        return;
-      }
 
+      // without a sender, e.g. while the track is republished, the pause applies to the next one
       this._isUpstreamPaused = true;
       this.emit(TrackEvent.UpstreamPaused, this);
       const browser = getBrowser();
@@ -549,9 +556,7 @@ export default abstract class LocalTrack<
         // https://bugs.webkit.org/show_bug.cgi?id=184911
         throw new DeviceUnsupportedError('pauseUpstream is not supported on Safari < 12.');
       }
-      if (this.sender.transport?.state !== 'closed') {
-        await this.sender.replaceTrack(null);
-      }
+      await this.syncSenders();
     } finally {
       unlock();
     }
@@ -563,19 +568,39 @@ export default abstract class LocalTrack<
       if (this._isUpstreamPaused === false) {
         return;
       }
-      if (!this.sender) {
-        this.log.warn('unable to resume upstream for an unpublished track', this.logContext);
-        return;
-      }
       this._isUpstreamPaused = false;
       this.emit(TrackEvent.UpstreamResumed, this);
-
-      if (this.sender.transport?.state !== 'closed') {
-        // this operation is noop if mediastreamtrack is already being sent
-        await this.sender.replaceTrack(this.mediaStreamTrack);
-      }
+      await this.syncSenders();
     } finally {
       unlock();
+    }
+  }
+
+  /**
+   * @internal
+   * Puts on every sender of this track what it should carry: nothing while the upstream is
+   * paused, the (processed) track otherwise. This is the only place that swaps the track of a
+   * sender, every operation changes the state and then calls it. A sender that does not exist
+   * yet, or whose connection is closed, is left alone: a new sender is synced once it is set.
+   */
+  async syncSenders() {
+    const unlock = await this.senderSyncLock.lock();
+    try {
+      await this.applySenderTracks();
+    } finally {
+      unlock();
+    }
+  }
+
+  /** Called with the sender sync lock held, see {@link syncSenders}. */
+  protected async applySenderTracks() {
+    const { sender } = this;
+    if (!sender || sender.transport?.state === 'closed') {
+      return;
+    }
+    const expected = this._isUpstreamPaused ? null : this.mediaStreamTrack;
+    if (sender.track !== expected) {
+      await sender.replaceTrack(expected);
     }
   }
 
@@ -659,8 +684,8 @@ export default abstract class LocalTrack<
             attachToElement(this.processor.processedTrack, el);
           }
         }
-        await this.sender?.replaceTrack(this.processor.processedTrack);
       }
+      await this.syncSenders();
       this.emit(TrackEvent.TrackProcessorUpdate, this.processor);
     } finally {
       unlock();

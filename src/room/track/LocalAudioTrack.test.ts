@@ -109,4 +109,23 @@ describe('LocalAudioTrack sender contents', () => {
     expect(processor.processedTrack).not.toBe(first);
     expect(sender.track).toBe(processor.processedTrack);
   });
+
+  it('keeps a paused track off the sender when a processor is set', async () => {
+    const { track, sender } = await publish(makeMediaStreamTrack('microphone'));
+    await track.pauseUpstream();
+
+    await track.setProcessor(makeProcessor());
+
+    expect(sender.track).toBeNull();
+  });
+
+  it('keeps a paused track off the sender when the audio context changes', async () => {
+    const { track, sender } = await publish(makeMediaStreamTrack('microphone'));
+    await track.setProcessor(makeProcessor());
+    await track.pauseUpstream();
+
+    await track.setAudioContext({} as AudioContext);
+
+    expect(sender.track).toBeNull();
+  });
 });

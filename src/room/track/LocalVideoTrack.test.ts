@@ -1,5 +1,5 @@
+import { Mutex } from '@livekit/mutex';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Mutex } from '@livekit/mutex';
 import LocalVideoTrack, { videoLayersFromEncodings } from './LocalVideoTrack';
 import type { SimulcastTrackInfo } from './LocalVideoTrack';
 import { Track, VideoQuality } from './Track';
@@ -144,7 +144,11 @@ function makeSender(label = 'sender', events: string[] = []) {
     headerExtensions: [],
     rtcp: {},
   };
-  return {
+  const sender = {
+    track: null as MediaStreamTrack | null,
+    replaceTrack: vi.fn(async (track: MediaStreamTrack | null) => {
+      sender.track = track;
+    }),
     getParameters: () => params,
     // resolves on a later task, like the real setParameters, so that a caller
     // which fails to await it never observes the update
@@ -158,6 +162,7 @@ function makeSender(label = 'sender', events: string[] = []) {
       return params.degradationPreference;
     },
   };
+  return sender;
 }
 
 function makeTrack() {
@@ -166,10 +171,15 @@ function makeTrack() {
     log: { debug: vi.fn(), warn: vi.fn() },
     simulcastCodecs: new Map<VideoCodec, SimulcastTrackInfo>(),
     subscribedCodecs: undefined,
+    senderSyncLock: new Mutex(),
   });
   // logContext and mediaStreamTrack are getters we don't set up state for here
   Object.defineProperty(track, 'logContext', { get: () => ({}) });
-  Object.defineProperty(track, 'mediaStreamTrack', { get: () => ({ clone: () => ({}) }) });
+  const camera = {
+    readyState: 'live',
+    clone: () => ({ readyState: 'live', stop: () => {} }),
+  };
+  Object.defineProperty(track, 'mediaStreamTrack', { get: () => camera });
   return track;
 }
 
@@ -437,41 +447,30 @@ describe('backup codec tracks', () => {
 
   it('keeps a newer backup codec track when an older swap is rejected after it', async () => {
     const { track, info, backup } = await publishWithBackupCodec(makeMediaStreamTrack('camera'));
-    let rejectRetry: ((error: Error) => void) | undefined;
+    let rejectOlder: ((error: Error) => void) | undefined;
     backup.replaceTrack.mockImplementation(async (next: MediaStreamTrack | null) => {
       if (next?.id === 'camera-b-clone0') {
-        throw new Error('rejected');
-      }
-      if (next?.id === 'camera-b-clone1' && !rejectRetry) {
-        // the retry's swap is still pending when the next camera comes in, then fails
+        // still pending when the next camera comes in, then fails
         return new Promise<void>((_, reject) => {
-          rejectRetry = reject;
+          rejectOlder = reject;
         });
       }
       backup.track = next;
     });
-    await expect(track.replaceTrack(makeMediaStreamTrack('camera-b'))).rejects.toThrow('rejected');
 
-    // a retry is queued behind a failing track change, and starts its swap
-    const { processor, rejectInit } = makeFailingProcessor();
-    const setup = track.setProcessor(processor);
+    const older = track.replaceTrack(makeMediaStreamTrack('camera-b'));
     await flush();
-    await track.resumeUpstream();
-    rejectInit(new Error('init failed'));
-    await expect(setup).rejects.toThrow('init failed');
-    await flush();
-    expect(rejectRetry).toBeDefined();
-
+    expect(rejectOlder).toBeDefined();
     const cameraC = makeMediaStreamTrack('camera-c');
-    await track.replaceTrack(cameraC);
-    rejectRetry!(new Error('rejected'));
-    await flush();
+    const newer = track.replaceTrack(cameraC);
+    rejectOlder!(new Error('rejected'));
+    await expect(older).rejects.toThrow('rejected');
+    await newer;
 
-    // the failed retry must not take the newer camera off the backup codec
+    // the failed swap must not take the newer camera off the backup codec
     expect(backup.track).toBe(cameraC.clones[0]);
     expect(info.mediaStreamTrack).toBe(cameraC.clones[0]);
     expect(cameraC.clones[0].readyState).toBe('live');
-    expect(info.needsRefresh).toBe(false);
   });
 
   it('drops a pending backup codec retry when the track is stopped first', async () => {
@@ -677,6 +676,82 @@ describe('backup codec tracks', () => {
       await track.resumeUpstream();
 
       expect(primary.replaceTrack).not.toHaveBeenCalled();
+    });
+
+    it('leaves a backup codec sender alone once its transport is closed', async () => {
+      const { track, backup } = await publishWithBackupCodec(makeMediaStreamTrack('camera'));
+      // a sender of a closed connection rejects every swap
+      Object.assign(backup, { transport: { state: 'closed' } });
+      backup.replaceTrack.mockReset().mockRejectedValue(new Error('InvalidStateError'));
+
+      await track.pauseUpstream();
+      await track.resumeUpstream();
+
+      expect(backup.replaceTrack).not.toHaveBeenCalled();
+    });
+
+    it('keeps every sender off the track when a pause follows a resume that is still running', async () => {
+      const { track, backup } = await publishWithBackupCodec(makeMediaStreamTrack('camera'));
+      await track.pauseUpstream();
+      // swaps take a while in a browser, which lets the two calls interleave
+      for (const sender of [senderOf(track), backup]) {
+        sender.replaceTrack.mockImplementation(async (next: MediaStreamTrack | null) => {
+          await flush();
+          sender.track = next;
+        });
+      }
+
+      await Promise.all([track.resumeUpstream(), track.pauseUpstream()]);
+
+      expect(track.isUpstreamPaused).toBe(true);
+      expect(senderOf(track).track).toBeNull();
+      expect(backup.track).toBeNull();
+    });
+
+    it('keeps a pause requested while the track has no sender', async () => {
+      // a full reconnect unpublishes the track before publishing it again over a new sender
+      const { track } = await publishWithBackupCodec(makeMediaStreamTrack('camera'));
+      Object.assign(track, { _sender: undefined });
+
+      await track.pauseUpstream();
+
+      expect(track.isUpstreamPaused).toBe(true);
+    });
+
+    it('keeps a paused track off a new sender', async () => {
+      const { track } = await publishWithBackupCodec(makeMediaStreamTrack('camera'));
+      await track.pauseUpstream();
+      // a full reconnect publishes the track again over a sender that starts with it
+      const sender = makeTrackSender();
+      await sender.replaceTrack(track.mediaStreamTrack);
+      Object.assign(track, { _sender: sender });
+
+      await track.syncSenders();
+
+      expect(sender.track).toBeNull();
+    });
+
+    it('keeps a paused track off a new backup codec sender', async () => {
+      const { track } = await publishWithBackupCodec(makeMediaStreamTrack('camera'));
+      await track.pauseUpstream();
+      const info = track.addSimulcastTrack('av1', [])!;
+      const sender = makeTrackSender();
+      await sender.replaceTrack(info.mediaStreamTrack);
+
+      await track.setSimulcastTrackSender('av1', sender as unknown as RTCRtpSender);
+
+      expect(sender.track).toBeNull();
+    });
+
+    it('keeps a paused track off the senders when a processor is set', async () => {
+      const { track, backup } = await publishWithBackupCodec(makeMediaStreamTrack('camera'));
+      await track.pauseUpstream();
+
+      await track.setProcessor(makeProcessor());
+
+      expect(track.isUpstreamPaused).toBe(true);
+      expect(senderOf(track).track).toBeNull();
+      expect(backup.track).toBeNull();
     });
 
     it('stops every clone when the track is stopped', async () => {

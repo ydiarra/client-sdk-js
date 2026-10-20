@@ -258,10 +258,8 @@ export default class LocalAudioTrack extends LocalTrack<Track.Kind.Audio> {
 
       await processor.init(processorOptions);
       this.processor = processor;
-      if (this.processor.processedTrack) {
-        await this.sender?.replaceTrack(this.processor.processedTrack);
-        this.observeProcessedTrack(this.processor.processedTrack);
-      }
+      await this.syncSenders();
+      this.observeProcessedTrack(this.processor.processedTrack);
       this.emit(TrackEvent.TrackProcessorUpdate, this.processor);
     } finally {
       unlock();
@@ -313,10 +311,8 @@ export default class LocalAudioTrack extends LocalTrack<Track.Kind.Audio> {
         audioContext,
         localTrack: this,
       });
-      if (this.processor.processedTrack) {
-        await this.sender?.replaceTrack(this.processor.processedTrack);
-        this.observeProcessedTrack(this.processor.processedTrack);
-      }
+      await this.syncSenders();
+      this.observeProcessedTrack(this.processor.processedTrack);
       this.emit(TrackEvent.TrackProcessorUpdate, this.processor);
     } finally {
       unlock();

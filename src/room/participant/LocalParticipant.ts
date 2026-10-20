@@ -966,6 +966,8 @@ export class LocalParticipant extends Participant {
       }
 
       track.sender = await this.engine.createSender(track, opts, encodings);
+      // the sender starts with the track, which a paused upstream must not send
+      await track.syncSenders();
       if (isLocalVideoTrack(track)) {
         track.publishOptions = opts;
       }
