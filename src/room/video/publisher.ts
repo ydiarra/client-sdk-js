@@ -30,6 +30,7 @@ import type {
 import { ScreenSharePresets, VideoPresets, isBackupVideoCodec } from '../track/options';
 import {
   getLogContextFromTrack,
+  isMutedOnServer,
   mimeTypeToVideoCodecString,
   screenCaptureToDisplayMediaStreamOptions,
 } from '../track/utils';
@@ -403,8 +404,7 @@ export async function publishAdditionalCodecForTrack(
   const req = new AddTrackRequest({
     cid: simulcastTrack.mediaStreamTrack.id,
     type: Track.kindToProto(track.kind),
-    // match the primary publish request, the backup sender starts without a paused track
-    muted: track.isMuted || track.isUpstreamPaused,
+    muted: isMutedOnServer(track),
     source: Track.sourceToProto(track.source),
     sid: track.sid,
     width: dims?.width,

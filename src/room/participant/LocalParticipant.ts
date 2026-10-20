@@ -59,6 +59,7 @@ import type {
 import {
   getLogContextFromTrack,
   getTrackSourceFromProto,
+  isMutedOnServer,
   mergeDefaultOptions,
   sourceToKind,
 } from '../track/utils';
@@ -929,8 +930,7 @@ export class LocalParticipant extends Participant {
       cid: track.mediaStreamTrack.id,
       name: opts.name,
       type: Track.kindToProto(track.kind),
-      // the server sees a paused upstream as muted, see onTrackUpstreamPaused
-      muted: track.isMuted || track.isUpstreamPaused,
+      muted: isMutedOnServer(track),
       source: Track.sourceToProto(track.source),
       disableDtx,
       encryption: this.encryptionType,
@@ -1449,7 +1449,7 @@ export class LocalParticipant extends Participant {
       const pub = this.trackPublications.get(ti.sid);
 
       if (pub) {
-        const mutedOnServer = pub.isMuted || (pub.track?.isUpstreamPaused ?? false);
+        const mutedOnServer = pub.track ? isMutedOnServer(pub.track) : pub.isMuted;
         if (mutedOnServer !== ti.muted) {
           this.log.debug('updating server mute state after reconcile', {
             ...getLogContextFromTrack(pub),
@@ -1499,16 +1499,12 @@ export class LocalParticipant extends Participant {
 
   /** @internal */
   private onTrackUnmuted = (track: LocalTrack) => {
-    this.onTrackMuted(track, track.isUpstreamPaused);
+    this.onTrackMuted(track);
   };
 
   // when the local track changes in mute status, we'll notify server as such
   /** @internal */
-  private onTrackMuted = (track: LocalTrack, muted?: boolean) => {
-    if (muted === undefined) {
-      muted = true;
-    }
-
+  private onTrackMuted = (track: LocalTrack) => {
     if (!track.sid) {
       this.log.error(
         'could not update mute status for unpublished track',
@@ -1517,17 +1513,17 @@ export class LocalParticipant extends Participant {
       return;
     }
 
-    this.engine.updateMuteStatus(track.sid, muted);
+    this.engine.updateMuteStatus(track.sid, isMutedOnServer(track));
   };
 
   private onTrackUpstreamPaused = (track: LocalTrack) => {
     this.log.debug('upstream paused', getLogContextFromTrack(track));
-    this.onTrackMuted(track, true);
+    this.onTrackMuted(track);
   };
 
   private onTrackUpstreamResumed = (track: LocalTrack) => {
     this.log.debug('upstream resumed', getLogContextFromTrack(track));
-    this.onTrackMuted(track, track.isMuted);
+    this.onTrackMuted(track);
   };
 
   private onTrackFeatureUpdate = (track: LocalAudioTrack) => {

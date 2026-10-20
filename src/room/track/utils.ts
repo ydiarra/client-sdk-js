@@ -2,6 +2,7 @@ import { TrackInfo, TrackPublishedResponse, TrackSource, VideoQuality } from '@l
 import log from '../../logger';
 import { cloneDeep } from '../../utils/cloneDeep';
 import { isSafari, sleep } from '../utils';
+import type LocalTrack from './LocalTrack';
 import { Track } from './Track';
 import type { TrackPublication } from './TrackPublication';
 import {
@@ -466,4 +467,12 @@ export async function waitForFirstVideoFrame(
       element.srcObject = null;
     }
   }
+}
+
+/**
+ * @internal
+ * The server sees a local track as muted while it is muted, and while its upstream is paused.
+ */
+export function isMutedOnServer(track: Pick<LocalTrack, 'isMuted' | 'isUpstreamPaused'>) {
+  return track.isMuted || track.isUpstreamPaused;
 }
